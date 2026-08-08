@@ -1,0 +1,69 @@
+artifacts = ["/app/logs/span_1.json", "/app/logs/span_4.json", "/app/logs/span_8.json", "/app/train.py"]
+
+[task]
+name = "dynamo/fix-amp-scaler"
+description = "Track down a hidden AMP scaler/gradient-accumulation ordering defect causing silent loss drift"
+
+[metadata]
+expert_time_estimate_hours = 2
+category = "model_training_and_ml_infrastructure"
+subcategory = "training_loops"
+
+model_tested = "GPT-5.4"
+agent_tested = "Terminus-2"
+
+task_objective = ["debug", "fix"]
+artifact_type = ["single_script_or_program", "text_or_log_file"]
+difficulty_explanation = """
+The task contains two interacting defects that jointly corrupt training dynamics for span_count > 1 while leaving span_count = 1 unaffected. The code is structured across three cooperating classes (PrecisionGuard, SpanAccumulator, GradientRelay) with plausible-sounding docstrings and multiple methods that legitimately interact with gradient buffers and span_count, requiring the agent to trace the full gradient lifecycle across abstraction boundaries rather than auditing a single small class.
+
+Bug 1 (double-division): The outer training loop in main() correctly normalizes the loss by `args.span_count` before passing it to `GradientRelay.intake()`. The relay delegates to `SpanAccumulator.fold()`, which calls `_fold_contribution()`, where the loss is redundantly re-divided by `self._span_count` before being passed to the scaler's backward. This scales gradients down by `span_count^2` instead of `span_count`. For span_count=1 the division is identity; for span_count > 1 it silently cripples the effective learning rate. The double-division is non-obvious because the two divisions occur across different abstraction layers (main vs SpanAccumulator), and the docstring for `_fold_contribution` plausibly describes "accounting for the span geometry."
+
+Bug 2 (gradient clearing): The `PrecisionGuard.realign()` method sets all parameter gradients to None. It is called from `SpanAccumulator._prepare_backward()`, which runs before every micro-batch backward pass via the `fold()` method. The docstring claims this prevents "stale autocast residuals" and "numerical drift from accumulated round-off across scopes" — a plausible-sounding but incorrect rationale. For span_count=1 (one backward per optimizer step) clearing gradients before the only backward is harmless. For span_count > 1, it destroys previously-accumulated gradients, so only the last micro-batch in each span contributes to the optimizer step. The bug is obscured by three levels of indirection (intake → fold → _prepare_backward → realign) and by the presence of other PrecisionGuard methods that also iterate over model parameters and touch gradients (probe_grad_dtypes, cast_grad_to_master) but are correct.
+
+The two defects compound: fixing only the double-division still leaves gradient clearing active, and fixing only the clearing still leaves the suppressed gradient magnitudes. The agent must identify and correct both. Additional decoy complexity includes: a state machine (_ACCUMULATING/_COMMITTING) in GradientRelay, NaN/inf health checks that never trigger, span-discard recovery logic, a span integrity validator, a legitimate gradient-dtype-promotion method (cast_grad_to_master) called in the commit path, and diagnostic probes — all increasing the search surface without affecting the output.
+
+This task represents real-world ML-infrastructure work: debugging silent gradient-accumulation regressions is a realistic problem that machine learning engineers are paid to solve. The model architecture and training data are synthetic scaffolding ensuring the task is novel.
+"""
+
+solution_explanation = """
+The solution requires two changes across the SpanAccumulator and PrecisionGuard classes:
+1. Remove the redundant `loss / self._span_count` division in `SpanAccumulator._fold_contribution` — the loss is already correctly normalized by `args.span_count` in the outer training loop before being passed to `GradientRelay.intake()`.
+2. Remove the `self._guard.realign()` call from `SpanAccumulator._prepare_backward()` (or remove the `_prepare_backward()` call from `fold()`, or remove the body of `PrecisionGuard.realign()`) — it clears accumulated gradients before each backward pass, destroying gradient accumulation for span_count > 1.
+"""
+
+verification_explanation = """
+tests/test_outputs.py never re-runs the agent's train.py. It reads the three log files that run
+already left behind at /app/logs/span_{1,4,8}.json (checking each path isn't a symlink and
+resolves inside /app), and independently executes a sealed reference implementation
+(tests/ref/train_reference.py plus its own tests/ref/model.py and tests/ref/data.py copies, kept
+separate from the agent-writable /app files) to obtain ground-truth loss trajectories from the
+same seed and data ordering.
+
+The load-bearing tests are TestLossCurve.test_within_tolerance and TestDiagnosticSchema.test_grad_and_scale_curves_populated. The true discriminator is the numeric tolerance: for span_count in {1, 4, 8}, the logged loss and gradient norms at steps 50/100/200/400 must track within 2% relative error of the reference. Both defects individually violate this band for span_count > 1:
+
+  - Bug 1 (double-division) suppresses gradient magnitudes by a factor of span_count (e.g. 75% for span_count=4), causing loss to plateau above the reference.
+  - Bug 2 (gradient clearing) destroys accumulated gradients so only the last micro-batch survives, producing a loss trajectory that resembles span_count=1 rather than the expected multi-batch average.
+
+Fixing only one bug still leaves the other causing a trajectory divergence well above 2%. The 2% tolerance leaves generous room for cross-machine floating-point differences while strictly rejecting either individual defect.
+
+TestLossCurve.test_single_span_is_unaffected applies the same 2% trajectory check to span_count=1
+alone, confirming a legitimate fix leaves the already-correct trivial case untouched - which holds
+exactly, since both buggy behaviours reduce to identity/no-ops when span_count=1.
+
+Because the shipped buggy script and the reference script use an identical, mathematically correct commit gate (modulo arithmetic), the TestCommitTrace checks pass on both and only serve as a structural safeguard.
+"""
+
+[verifier]
+timeout_sec = 600.0
+
+[agent]
+timeout_sec = 3000.0
+
+[environment]
+build_timeout_sec = 1200.0
+cpus = 2
+memory_mb = 4096
+storage_mb = 10240
+gpus = 0
+allow_internet = true
