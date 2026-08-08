@@ -1,4 +1,4 @@
-#AMP Scaler & Gradient Accumulation Benchmark Task (`fix-amp-scaler`)
+## AMP Scaler & Gradient Accumulation Benchmark Task (`fix-amp-scaler`)
 
 This repository contains a machine learning infrastructure debugging task designed for evaluating AI coding agents. The task focuses on diagnosing and fixing a subtle, silent gradient accumulation defect that corrupts mixed-precision training dynamics when scaling across micro-batches (`span_count > 1`).
 
