@@ -46,7 +46,7 @@ The bug in [`environment/data/train.py`](file:///Users/rahulmac/Documents/Projec
 
 1. **Redundant Loss Division (Double-Scaling)**:
    - The outer training loop normalizes `loss` by `args.span_count`.
-   - Internal helper methods (e.g., `FragmentReducer._stabilize_fragment_scale`) re-divide the loss by `span_count`, causing effective gradients to be scaled down by $\text{span\_count}^2$ instead of $\text{span\_count}$.
+   - Internal helper methods (e.g., `FragmentReducer._stabilize_fragment_scale`) re-divide the loss by `span_count`, causing effective gradients to be scaled down by `span_count²` instead of `span_count`.
 2. **Premature Gradient Resetting**:
    - `CastBarrier._reseat_slots()` or `PrecisionGuard.realign()` clears parameter gradients before every micro-batch backward pass.
    - For `span_count > 1`, this destroys previously accumulated gradients so only the final micro-batch in a span contributes to the optimizer update.
